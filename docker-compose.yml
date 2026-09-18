@@ -1,0 +1,185 @@
+﻿version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: genesis-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: \
+      POSTGRES_PASSWORD: \
+      POSTGRES_DB: \
+    ports:
+      - "\:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/docker/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \ -d \"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: genesis-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "\:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: genesis-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: \
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    ports:
+      - "\:7474"
+      - "\:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2024-05-10T01-41-38Z
+    container_name: genesis-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: \
+      MINIO_ROOT_PASSWORD: \
+    ports:
+      - "\:9000"
+      - "\:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-05-09T17-04-24Z
+    container_name: genesis-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 \ \;
+      mc mb local/\ --ignore-existing;
+      mc anonymous set download local/\;
+      exit 0;
+      "
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../infra/docker/backend.Dockerfile
+    container_name: genesis-backend
+    restart: unless-stopped
+    environment:
+      APP_ENV: \
+      DATABASE_URL: postgresql+asyncpg://\:\@postgres:5432/\
+      DATABASE_URL_SYNC: postgresql://\:\@postgres:5432/\
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: \
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: \
+      S3_SECRET_KEY: \
+      S3_BUCKET_NAME: \
+      S3_REGION: \
+      JWT_SECRET_KEY: \
+      OPENAI_API_KEY: \
+      COHERE_API_KEY: \
+      CORS_ORIGINS: \
+    ports:
+      - "\:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: ../infra/docker/backend.Dockerfile
+    container_name: genesis-worker
+    restart: unless-stopped
+    environment:
+      APP_ENV: \
+      DATABASE_URL: postgresql+asyncpg://\:\@postgres:5432/\
+      DATABASE_URL_SYNC: postgresql://\:\@postgres:5432/\
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: \
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: \
+      S3_SECRET_KEY: \
+      S3_BUCKET_NAME: \
+      S3_REGION: \
+      JWT_SECRET_KEY: \
+      OPENAI_API_KEY: \
+      COHERE_API_KEY: \
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: celery -A app.workers.celery_app worker --loglevel=info -Q default,document_pipeline,embedding
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../infra/docker/frontend.Dockerfile
+    container_name: genesis-frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: \
+      NEXT_PUBLIC_APP_ENV: \
+    ports:
+      - "\:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
+  neo4j_data:
+  neo4j_logs:
+  minio_data:
